@@ -1,0 +1,21 @@
+{
+  "id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+  "area_id": null,
+  "config_entries": ["01J9KASAENTRY0000000000000"],
+  "configuration_url": "http://192.168.1.57",
+  "connections": [["mac", "54:af:97:12:34:56"]],
+  "disabled_by": null,
+  "entry_type": null,
+  "hw_version": "1.0",
+  "identifiers": [["tplink", "8006ABCDEF0123456789"]],
+  "labels": [],
+  "manufacturer": "TP-Link",
+  "model": "KP115",
+  "model_id": null,
+  "name": "Kitchen Plug",
+  "name_by_user": null,
+  "serial_number": null,
+  "suggested_area": "Kitchen",
+  "sw_version": "1.0.21",
+  "via_device_id": null
+}
