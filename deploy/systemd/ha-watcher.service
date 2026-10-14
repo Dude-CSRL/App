@@ -1,0 +1,24 @@
+# Example unit. Install: sudo cp deploy/systemd/ha-watcher.service /etc/systemd/system/
+# then: sudo systemctl daemon-reload && sudo systemctl enable --now ha-watcher
+[Unit]
+Description=Home Assistant device capture watcher (Phase 1)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=hawatcher
+WorkingDirectory=/opt/ha-watcher
+# Holds HA_URL, HA_TOKEN, HA_TOKEN_CREATED. chmod 600, owned by the service user.
+EnvironmentFile=/etc/ha-watcher/ha-watcher.env
+ExecStart=/opt/ha-watcher/.venv/bin/python -m ha_watcher --log-file /var/log/ha-watcher/device_capture.jsonl --state-file /var/lib/ha-watcher/seen_devices.json
+# Survive power flashes / HA restarts. Note: auth_invalid exits 2 and will also be
+# restarted every 12s; the repeated failures in `journalctl -u ha-watcher` are the signal.
+Restart=on-failure
+RestartSec=12
+StartLimitIntervalSec=0
+LogsDirectory=ha-watcher
+StateDirectory=ha-watcher
+
+[Install]
+WantedBy=multi-user.target
