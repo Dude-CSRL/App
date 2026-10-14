@@ -1,1 +1,2 @@
 websockets>=12,<18
+PyYAML>=6
