@@ -2,7 +2,7 @@
 
 Reads the JSONL capture log plus rotated backups (log, log.1, log.2, ...), dedupes by
 device ID, and writes a Markdown + JSON report. Optionally emits draft profile stubs
-(YAML) to seed Phase 2.
+(YAML) to seed Phase 2 profiles. Matching uses ha_watcher.matcher.
 
     python -m ha_watcher.report --log-file logs/device_capture.jsonl --out-dir reports \
         [--profiles-dir profiles] [--emit-stubs reports/profile_stubs]
@@ -19,6 +19,9 @@ import sys
 from pathlib import Path
 
 import yaml
+
+from . import matcher
+from .profiles import load_profiles
 
 FIELDS = ("manufacturer", "model", "name", "integration_domain", "identifiers",
           "connections", "suggested_area")
@@ -55,34 +58,6 @@ def integration_domain(device: dict) -> str | None:
     return None
 
 
-def load_profiles(profiles_dir: str | None) -> list[dict]:
-    if not profiles_dir or not os.path.isdir(profiles_dir):
-        return []
-    out = []
-    for p in sorted(Path(profiles_dir).glob("*.y*ml")):
-        try:
-            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError:
-            continue
-        if isinstance(data, dict):
-            data["_file"] = p.name
-            out.append(data)
-    return out
-
-
-def match_profile(dev: dict, profiles: list[dict]) -> str | None:
-    """Minimal placeholder matcher: case-insensitive manufacturer + model equality.
-    Profiles may set `status: draft` to be ignored. Real matching is Phase 2."""
-    for prof in profiles:
-        if prof.get("status") == "draft":
-            continue
-        m, mo = prof.get("manufacturer"), prof.get("model")
-        if m and mo and str(m).lower() == str(dev.get("manufacturer") or "").lower() \
-                and str(mo).lower() == str(dev.get("model") or "").lower():
-            return prof.get("_file")
-    return None
-
-
 def summarize(log_file: str, profiles_dir: str | None = None) -> dict:
     errors: list = []
     paths = log_files(log_file)
@@ -95,27 +70,33 @@ def summarize(log_file: str, profiles_dir: str | None = None) -> dict:
         if d is None:
             d = devices[did] = {"device_id": did, "first_seen": ts, "last_seen": ts, "occurrences": 0}
             d.update({f: None for f in FIELDS})
+            d["entity_ids"] = None
         d["occurrences"] += 1
         if ts and (not d["first_seen"] or ts < d["first_seen"]):
             d["first_seen"] = ts
         if ts and (not d["last_seen"] or ts > d["last_seen"]):
             d["last_seen"] = ts
+        if rec.get("entities"):
+            d["entity_ids"] = rec["entities"]
         if reg:  # latest non-empty registry snapshot wins
             for f in FIELDS:
                 v = integration_domain(reg) if f == "integration_domain" else reg.get(f)
                 if v not in (None, [], ""):
                     d[f] = v
-    profiles = load_profiles(profiles_dir)
+    loaded = load_profiles(profiles_dir)
     for d in devices.values():
-        prof = match_profile(d, profiles)
-        d["profile_match"] = prof
+        prof = matcher.match_device(d, d.get("entity_ids"), loaded.profiles)
+        d["profile_match"] = prof.file if prof else None
+        d["profile_name"] = prof.name if prof else None
         d["matched"] = prof is not None
     devs = sorted(devices.values(), key=lambda d: (d["first_seen"] or "", d["device_id"]))
     return {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "log_files": [os.path.basename(p) for p in paths],
-        "profiles_dir": profiles_dir if profiles else None,
-        "profiles_loaded": len(profiles),
+        "profiles_dir": profiles_dir if loaded.directory_found else None,
+        "profiles_loaded": len(loaded.profiles),
+        "profiles_active": len(loaded.active),
+        "profile_errors": [{"file": e.file, "error": e.message} for e in loaded.errors],
         "device_count": len(devs),
         "matched_count": sum(d["matched"] for d in devs),
         "malformed_lines": errors,
@@ -138,7 +119,8 @@ def render_markdown(rep: dict) -> str:
         f"- Log files: {', '.join(rep['log_files']) or '(none)'}",
         f"- Devices: {rep['device_count']} ({rep['matched_count']} matched, "
         f"{rep['device_count'] - rep['matched_count']} unmatched)",
-        f"- Profiles loaded: {rep['profiles_loaded']}",
+        f"- Profiles loaded: {rep['profiles_loaded']} ({rep['profiles_active']} active; drafts are never matched)",
+        f"- Invalid profile files: {len(rep['profile_errors'])}",
         f"- Malformed lines skipped: {len(rep['malformed_lines'])}", "",
         "| Device ID | Manufacturer | Model | Name | Domain | Identifiers | Connections | Suggested area | First seen | Last seen | Seen | Profile |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
@@ -148,6 +130,9 @@ def render_markdown(rep: dict) -> str:
             d["device_id"], d["manufacturer"], d["model"], d["name"], d["integration_domain"],
             d["identifiers"], d["connections"], d["suggested_area"], d["first_seen"], d["last_seen"],
             d["occurrences"], d["profile_match"] or "unmatched")) + " |")
+    if rep["profile_errors"]:
+        out += ["", "## Invalid profiles (skipped)", ""]
+        out += [f"- {e['file']}: {e['error']}" for e in rep["profile_errors"]]
     if rep["malformed_lines"]:
         out += ["", "## Malformed lines", ""]
         out += [f"- {e['file']}:{e['line']}: {e['error']}" for e in rep["malformed_lines"]]
@@ -172,20 +157,19 @@ def write_stubs(rep: dict, stub_dir: str) -> list[str]:
         path = os.path.join(stub_dir, f"{slug(key[0])}__{slug(key[1])}.yaml")
         if os.path.exists(path):
             continue
+        stem = os.path.splitext(os.path.basename(path))[0]
         stub = {
+            "name": stem,
             "status": "draft",
-            "manufacturer": d["manufacturer"],
-            "model": d["model"],
-            "integration_domain": d["integration_domain"],
-            "source_device_id": d["device_id"],
-            "example_identifiers": d["identifiers"],
-            "example_connections": d["connections"],
-            "suggested_area": d["suggested_area"],
-            "entity_patterns": [],
-            "provision": {"name": None, "area": None, "dashboard": None, "entity_ids": {}},
+            "match": {"manufacturer": d["manufacturer"], "model": d["model"], "entity_patterns": []},
+            "recipe": {"name": None, "area": None, "entity_id_cleanup": [],
+                       "dashboard_card": None, "welcome_automation": None},
+            "source": {"device_id": d["device_id"], "integration_domain": d["integration_domain"],
+                       "identifiers": d["identifiers"], "connections": d["connections"],
+                       "suggested_area": d["suggested_area"], "entity_ids": d.get("entity_ids")},
         }
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write("# DRAFT profile stub generated by ha_watcher.report. Review before use (Phase 2).\n")
+            fh.write("# DRAFT profile stub generated by ha_watcher.report. Review (see docs/profile-schema.md) and set status: active to enable.\n")
             yaml.safe_dump(stub, fh, sort_keys=False)
         written.append(path)
     return written

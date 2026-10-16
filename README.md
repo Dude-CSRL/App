@@ -26,7 +26,9 @@ pytest
 | `--state-file` | `state/seen_devices.json` | dedup state |
 | `--force-device-id ID` | — | re-log ID even if seen (repeatable) |
 | `--backoff-initial` / `--backoff-max` | 1 / 60 s | reconnect backoff (full jitter) |
-| `--no-device-details` | off | skip `config/device_registry/list` lookup |
+| `--profiles-dir` / `HA_WATCHER_PROFILES` | `profiles` | profile YAMLs used for matching (Phase 2) |
+| `--match-settle-delay` | 10 s | wait for entities to register before matching `entity_patterns` |
+| `--no-device-details` | off | skip device-registry lookup (everything logs as unmatched) |
 
 Exit codes: `0` normal, `2` auth rejected (`auth_invalid`, not retried), `3` missing config.
 
@@ -66,3 +68,24 @@ python -m ha_watcher.report --log-file logs/device_capture.jsonl --out-dir repor
   case-insensitive `manufacturer` + `model`; files with `status: draft` are ignored. No profiles dir means all devices are unmatched.
 - `--emit-stubs DIR` writes one `status: draft` YAML stub per unmatched manufacturer+model (existing files are never overwritten).
 - Malformed/truncated lines are skipped and listed in the report. Exit 1 if no log exists.
+
+## Phase 2: profile matcher
+
+Profiles live in `profiles/*.yaml` (schema: [docs/profile-schema.md](docs/profile-schema.md)). At startup the
+watcher loads and validates them, logs any invalid file at ERROR level (and keeps running), and every captured
+device line gets a `match` field: `{"matched": true, "profile": "<name>"}` or `{"matched": false, ...}`.
+Matching is case-insensitive exact manufacturer + model, then optional glob `entity_patterns`; `status: draft`
+profiles are never matched. The `recipe` section is validated but **not executed** (Phase 3).
+`profiles/example_hue_bulb.yaml` is a draft example built from mock data.
+
+Try it against the mock server (the fixture profiles in `tests/fixtures/profiles/` match both mock devices and
+include two deliberately invalid files so you can see the startup errors):
+```bash
+python -m tests.mock_ha_server --port 8765 --token test-token --delay 1      # terminal 1
+HA_URL=ws://127.0.0.1:8765/api/websocket HA_TOKEN=test-token \
+  python -m ha_watcher --profiles-dir tests/fixtures/profiles --match-settle-delay 1 \
+  --log-file logs/mock_capture.jsonl --state-file state/mock_seen.json -v    # terminal 2
+tail -f logs/mock_capture.jsonl | python -c "import sys,json; [print(json.loads(l)['device']['name'], json.loads(l)['match']) for l in sys.stdin]"
+```
+The monitoring report (`python -m ha_watcher.report`) uses the same matcher; `--emit-stubs` now writes draft
+stubs in the profile schema (`name`, `status: draft`, `match`, `recipe`, `source`).

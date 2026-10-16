@@ -1,0 +1,4 @@
+status: active
+match: {manufacturer: Acme}
+colour: red
+recipe: {area: 5, entity_id_cleanup: [{from: a}]}

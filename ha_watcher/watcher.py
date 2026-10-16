@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 import websockets
 
+from . import matcher
+from .profiles import LoadResult, load_profiles
 from .state import SeenDevices
 
 EVENT_TYPE = "device_registry_updated"
@@ -45,6 +47,9 @@ class Config:
     backoff_max: float = 60.0
     token_created: str | None = None
     fetch_device_details: bool = True
+    profiles_dir: str | None = None  # None disables matching (CLI default: profiles)
+    match_settle_delay: float = 10.0  # wait before reading entities when a profile needs entity patterns
+    request_timeout: float = 30.0
 
 
 def backoff_delays(initial: float, cap: float, rng: random.Random | None = None):
@@ -99,6 +104,22 @@ class Watcher:
         self.capture = make_capture_logger(cfg.log_file, cfg.max_bytes, cfg.backup_count)
         self._msg_id = 0
         self.connections = 0  # successful authenticated sessions (useful for tests)
+        self.profiles: LoadResult = load_profiles(cfg.profiles_dir)
+        self._report_profiles()
+
+    def _report_profiles(self) -> None:
+        res = self.profiles
+        if not self.cfg.profiles_dir:
+            diag.info("profile matching disabled (no profiles dir)")
+        elif not res.directory_found:
+            diag.warning("profiles dir %r not found; every device will be logged as unmatched", self.cfg.profiles_dir)
+        else:
+            diag.info("loaded %d profile(s) from %s: %d active, %d draft (drafts are not matched)",
+                      len(res.profiles), self.cfg.profiles_dir, len(res.active), len(res.drafts))
+        for err in res.errors:
+            diag.error("INVALID PROFILE (skipped) %s", err)
+        if res.errors:
+            diag.error("%d profile file(s) skipped; fix them and restart the watcher", len(res.errors))
 
     def _next_id(self) -> int:
         self._msg_id += 1
@@ -116,15 +137,31 @@ class Watcher:
             raise ConnectionError(f"unexpected auth reply: {reply!r}")
         diag.info("authenticated to HA %s", reply.get("ha_version", "?"))
 
-    async def _request(self, ws, payload: dict, pending: dict) -> int:
+    async def _call(self, ws, payload: dict, pending: dict) -> dict:
+        """Send a command and wait for its result message (resolved by the receive loop)."""
         mid = self._next_id()
-        payload = {"id": mid, **payload}
         fut = asyncio.get_running_loop().create_future()
         pending[mid] = fut
-        await ws.send(json.dumps(payload))
-        return mid
+        try:
+            await ws.send(json.dumps({"id": mid, **payload}))
+            return await asyncio.wait_for(fut, self.cfg.request_timeout)
+        finally:
+            pending.pop(mid, None)
 
-    def handle_created(self, event_msg: dict, device: dict | None) -> bool:
+    def match_result(self, device: dict | None, entity_ids: list[str] | None) -> dict:
+        """Match a captured device against loaded profiles. Returned dict is logged as `match`."""
+        if device is None:
+            return {"matched": False, "profile": None, "profile_file": None, "reason": "no_device_details"}
+        prof = matcher.match_device(device, entity_ids, self.profiles.profiles)
+        if prof is None:
+            return {"matched": False, "profile": None, "profile_file": None, "reason": "no_matching_profile"}
+        return {"matched": True, "profile": prof.name, "profile_file": prof.file}
+
+    def _would_log(self, device_id: str) -> bool:
+        return device_id not in self.seen or device_id in self.cfg.force_device_ids
+
+    def handle_created(self, event_msg: dict, device: dict | None,
+                       entity_ids: list[str] | None = None) -> bool:
         """Log a device-created event. Returns True if a line was written."""
         event = event_msg.get("event", {})
         data = event.get("data", {})
@@ -136,6 +173,7 @@ class Watcher:
         if device_id in self.seen and not forced:
             diag.info("dedup: device %s already logged, skipping", device_id)
             return False
+        match = self.match_result(device, entity_ids)
         record = {
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
             "event_type": event.get("event_type", EVENT_TYPE),
@@ -144,48 +182,84 @@ class Watcher:
             "forced": forced,
             "raw_payload": event_msg,
             "device": device,
+            "entities": entity_ids,
+            "match": match,
         }
         self.capture.info(json.dumps(record, sort_keys=False, separators=(",", ":")))
         for h in self.capture.handlers:
             h.flush()
         self.seen.add(device_id)
-        diag.info("captured device %s%s", device_id, " (forced)" if forced else "")
+        diag.info("captured device %s%s -> %s", device_id, " (forced)" if forced else "",
+                  f"matched profile {match['profile']}" if match["matched"] else "unmatched")
         return True
+
+    async def _fetch_device(self, ws, pending, device_id: str) -> dict | None:
+        res = await self._call(ws, {"type": "config/device_registry/list"}, pending)
+        if not res.get("success"):
+            return None
+        return next((d for d in res.get("result") or [] if d.get("id") == device_id), None)
+
+    async def _process_created(self, ws, pending: dict, event_msg: dict) -> None:
+        data = event_msg.get("event", {}).get("data", {})
+        device_id = data.get("device_id")
+        if not device_id or not self._would_log(device_id):
+            self.handle_created(event_msg, None)  # logs the dedup/skip decision
+            return
+        device = entity_ids = None
+        if self.cfg.fetch_device_details:
+            device = await self._fetch_device(ws, pending, device_id)
+            if device is not None and matcher.needs_entities(device, self.profiles.profiles):
+                # Entities are registered shortly after the device; wait, then re-read both.
+                await asyncio.sleep(self.cfg.match_settle_delay)
+                device = await self._fetch_device(ws, pending, device_id) or device
+                res = await self._call(ws, {"type": "config/entity_registry/list"}, pending)
+                if res.get("success"):
+                    entity_ids = [e["entity_id"] for e in res.get("result") or []
+                                  if e.get("device_id") == device_id and e.get("entity_id")]
+        self.handle_created(event_msg, device, entity_ids)
 
     async def run_once(self) -> None:
         """One connection lifetime. Raises AuthFailed, or returns/raises on disconnect."""
         self._msg_id = 0
-        async with websockets.connect(self.cfg.url, max_size=None) as ws:
-            await self._authenticate(ws)
-            self.connections += 1
-            sub_id = self._next_id()
-            await ws.send(json.dumps({"id": sub_id, "type": "subscribe_events", "event_type": EVENT_TYPE}))
-            pending: dict[int, asyncio.Future] = {}
-            waiting_events: dict[int, dict] = {}  # request id -> event message awaiting device details
-            async for raw in ws:
-                msg = json.loads(raw)
-                mtype = msg.get("type")
-                if mtype == "result" and msg.get("id") == sub_id:
-                    if not msg.get("success"):
-                        raise ConnectionError(f"subscribe failed: {msg!r}")
-                    diag.info("subscribed to %s", EVENT_TYPE)
-                elif mtype == "event" and msg.get("id") == sub_id:
-                    data = msg.get("event", {}).get("data", {})
-                    if data.get("action") != CREATE_ACTION:
-                        continue
-                    if self.cfg.fetch_device_details:
-                        mid = await self._request(ws, {"type": "config/device_registry/list"}, pending)
-                        waiting_events[mid] = msg
-                    else:
-                        self.handle_created(msg, None)
-                elif mtype == "result" and msg.get("id") in waiting_events:
-                    event_msg = waiting_events.pop(msg["id"])
-                    pending.pop(msg["id"], None)
-                    device = None
-                    if msg.get("success"):
-                        did = event_msg["event"]["data"].get("device_id")
-                        device = next((d for d in msg.get("result") or [] if d.get("id") == did), None)
-                    self.handle_created(event_msg, device)
+        tasks: set[asyncio.Task] = set()
+        pending: dict[int, asyncio.Future] = {}
+
+        def _done(t: asyncio.Task) -> None:
+            tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                exc = t.exception()
+                if not isinstance(exc, (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError)):
+                    diag.error("error processing created device: %r", exc)
+                else:
+                    diag.warning("created-device processing interrupted: %r", exc)
+
+        try:
+            async with websockets.connect(self.cfg.url, max_size=None) as ws:
+                await self._authenticate(ws)
+                self.connections += 1
+                sub_id = self._next_id()
+                await ws.send(json.dumps({"id": sub_id, "type": "subscribe_events", "event_type": EVENT_TYPE}))
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    mtype, mid = msg.get("type"), msg.get("id")
+                    if mtype == "result" and mid == sub_id:
+                        if not msg.get("success"):
+                            raise ConnectionError(f"subscribe failed: {msg!r}")
+                        diag.info("subscribed to %s", EVENT_TYPE)
+                    elif mtype == "event" and mid == sub_id:
+                        if msg.get("event", {}).get("data", {}).get("action") != CREATE_ACTION:
+                            continue
+                        t = asyncio.create_task(self._process_created(ws, pending, msg))
+                        tasks.add(t)
+                        t.add_done_callback(_done)
+                    elif mtype == "result" and mid in pending:
+                        if not pending[mid].done():
+                            pending[mid].set_result(msg)
+        finally:
+            for t in list(tasks):
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run(self) -> int:
         check_token_age(self.cfg.token_created)
@@ -228,6 +302,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="bypass dedup and re-log this device ID (repeatable)")
     p.add_argument("--backoff-initial", type=float, default=1.0)
     p.add_argument("--backoff-max", type=float, default=60.0)
+    p.add_argument("--profiles-dir", default=os.environ.get("HA_WATCHER_PROFILES", "profiles"),
+                   help="directory of profile YAML files used to match devices (default: profiles)")
+    p.add_argument("--match-settle-delay", type=float, default=10.0,
+                   help="seconds to wait for entities to register before matching entity_patterns")
     p.add_argument("--no-device-details", action="store_true",
                    help="don't fetch config/device_registry/list for created devices")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -248,6 +326,7 @@ def main(argv=None) -> int:
         force_device_ids=set(args.force_device_id), backoff_initial=args.backoff_initial,
         backoff_max=args.backoff_max, token_created=os.environ.get("HA_TOKEN_CREATED"),
         fetch_device_details=not args.no_device_details,
+        profiles_dir=args.profiles_dir, match_settle_delay=args.match_settle_delay,
     )
     try:
         return asyncio.run(Watcher(cfg).run())

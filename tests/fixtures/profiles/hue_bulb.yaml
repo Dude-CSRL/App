@@ -1,0 +1,15 @@
+name: hue_bulb
+status: active
+match:
+  manufacturer: "signify netherlands b.v."     # case-insensitive
+  model: "HUE WHITE AND COLOR AMBIANCE A19"
+  entity_patterns: ["light.hue_*"]
+recipe:
+  name: "Hue Bulb"
+  area: Living Room
+  entity_id_cleanup:
+    - {from: "light.hue_*", to: "light.living_room_*"}
+  dashboard_card:
+    dashboard: lovelace
+    card: {type: light, entity: light.living_room_lamp}
+  welcome_automation: automation.welcome_hue

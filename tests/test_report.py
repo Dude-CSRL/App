@@ -50,7 +50,7 @@ def test_cli_writes_md_json_and_stubs(tmp_path, capsys):
     files = list(stubs.iterdir())
     assert [f.name for f in files] == ["signify_netherlands_b_v__hue_white_and_color_ambiance_a19.yaml"]
     stub = yaml.safe_load(files[0].read_text())
-    assert stub["status"] == "draft" and stub["model"] == "Hue white and color ambiance A19"
+    assert stub["status"] == "draft" and stub["match"]["model"] == "Hue white and color ambiance A19"
     # rerun doesn't overwrite
     files[0].write_text("edited")
     report.main(["--log-file", log, "--out-dir", str(out), "--emit-stubs", str(stubs)])
