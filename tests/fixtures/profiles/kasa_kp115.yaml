@@ -1,0 +1,4 @@
+name: kasa_kp115
+status: active
+match: {manufacturer: TP-Link, model: KP115}
+recipe: {name: Smart Plug, area: Kitchen}

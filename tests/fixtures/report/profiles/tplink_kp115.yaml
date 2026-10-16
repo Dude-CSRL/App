@@ -1,3 +1,4 @@
-manufacturer: TP-Link
-model: KP115
-provision: {}
+status: active
+match:
+  manufacturer: TP-Link
+  model: KP115

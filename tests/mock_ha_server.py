@@ -4,6 +4,7 @@ Speaks just enough of the HA WebSocket API:
   auth_required -> auth -> auth_ok | auth_invalid
   subscribe_events (event_type=device_registry_updated) -> result
   config/device_registry/list -> result (devices emitted so far)
+  config/entity_registry/list -> result (entities registered via emit_device_created)
 and pushes device_registry_updated {action: create} events built from JSON fixtures
 (each fixture is a device-registry entry, see tests/fixtures/).
 
@@ -30,6 +31,12 @@ def load_fixture(path: str | Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def load_entity_ids(fixtures_dir: str | Path, device_id: str) -> list[str]:
+    """Entity IDs for a device from <fixtures_dir>/entities/<device_id>.json (list of strings), if present."""
+    p = Path(fixtures_dir) / "entities" / f"{device_id}.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+
+
 def load_fixtures(directory: str | Path) -> list[dict]:
     return [load_fixture(p) for p in sorted(Path(directory).glob("*.json"))]
 
@@ -41,6 +48,7 @@ class MockHA:
         self.bad_token = bad_token
         self.host, self.port = host, port
         self.devices: dict[str, dict] = {}
+        self.entities: list[dict] = []  # entity-registry entries
         self.subscribers: dict = {}  # ws -> subscription id
         self.subscribed = asyncio.Event()
         self.auth_attempts = 0
@@ -71,9 +79,13 @@ class MockHA:
     async def wait_subscribed(self, timeout: float = 5.0):
         await asyncio.wait_for(self.subscribed.wait(), timeout)
 
-    async def emit_device_created(self, device: dict) -> int:
-        """Register a device and push a create event to all subscribers. Returns #recipients."""
+    async def emit_device_created(self, device: dict, entity_ids: list[str] | None = None) -> int:
+        """Register a device (and optionally its entities) and push a create event to all
+        subscribers. Returns #recipients."""
         self.devices[device["id"]] = device
+        for eid in entity_ids or []:
+            self.entities.append({"entity_id": eid, "device_id": device["id"], "platform": "mock",
+                                  "disabled_by": None, "name": None})
         sent = 0
         for ws, sub_id in list(self.subscribers.items()):
             msg = {
@@ -115,6 +127,9 @@ class MockHA:
                 elif mtype == "config/device_registry/list":
                     await ws.send(json.dumps({"id": mid, "type": "result", "success": True,
                                               "result": list(self.devices.values())}))
+                elif mtype == "config/entity_registry/list":
+                    await ws.send(json.dumps({"id": mid, "type": "result", "success": True,
+                                              "result": list(self.entities)}))
                 elif mtype == "ping":
                     await ws.send(json.dumps({"id": mid, "type": "pong"}))
                 else:
@@ -134,7 +149,7 @@ async def _amain(args):
         await server.subscribed.wait()
         await asyncio.sleep(args.delay)
         for dev in fixtures:
-            n = await server.emit_device_created(dev)
+            n = await server.emit_device_created(dev, load_entity_ids(args.fixtures, dev['id']))
             log.info("emitted create for %s (%s) to %d subscriber(s)", dev["id"], dev.get("name"), n)
             await asyncio.sleep(args.delay)
         if not args.repeat:

@@ -1,0 +1,3 @@
+name: kasa_draft_only
+status: draft
+match: {manufacturer: TP-Link, model: KP115}

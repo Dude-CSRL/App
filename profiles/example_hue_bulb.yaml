@@ -1,0 +1,28 @@
+# EXAMPLE profile (status: draft, so it is never matched). Values come from the mock
+# fixture tests/fixtures/device_created_hue_bulb.json, not from a real captured device.
+# To use it: copy, replace match values with a real captured payload, review recipe, set status: active.
+# Schema: docs/profile-schema.md
+name: example_hue_bulb
+description: Example Hue color bulb profile (mock data)
+status: draft
+
+match:
+  manufacturer: "Signify Netherlands B.V."
+  model: "Hue white and color ambiance A19"
+  entity_patterns:          # optional; every pattern must match one of the device's entity IDs
+    - "light.*"
+
+# Parsed and validated in Phase 2, executed in Phase 3.
+recipe:
+  name: "Hue Bulb"
+  area: null                # null = ask / infer later (roadmap: area inference)
+  entity_id_cleanup:
+    - from: "light.hue_*"
+      to: "light.{area}_{name}"
+  dashboard_card:
+    dashboard: lovelace
+    view: lights
+    card:
+      type: light
+      entity: "{light_entity}"
+  welcome_automation: null
