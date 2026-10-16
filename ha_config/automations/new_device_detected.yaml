@@ -1,0 +1,57 @@
+# Spike example: native HA detection of newly created devices.
+# Paste into automations.yaml (or include this file). Requires HA 2024.10+ syntax (triggers/actions).
+- id: ha_device_automation_new_device_detected
+  alias: "Device automation: new device detected"
+  description: >
+    Fires on every device-registry create, waits for entities to register, then
+    branches on manufacturer/model. Matched devices hand off to a recipe (script or
+    the external watcher via a custom event); unknown devices notify.
+  mode: queued
+  max: 20
+  triggers:
+    - trigger: event
+      event_type: device_registry_updated
+      event_data:
+        action: create
+  variables:
+    device_id: "{{ trigger.event.data.device_id }}"
+  actions:
+    # At create time the integration may not have registered entities yet.
+    - delay: "00:00:10"
+    - variables:
+        manufacturer: "{{ device_attr(device_id, 'manufacturer') or '' }}"
+        model: "{{ device_attr(device_id, 'model') or '' }}"
+        name: "{{ device_attr(device_id, 'name') or device_id }}"
+        entities: "{{ device_entities(device_id) }}"
+    - choose:
+        - alias: "Known: TP-Link KP115 plug"
+          conditions:
+            - condition: template
+              value_template: "{{ manufacturer == 'TP-Link' and model == 'KP115' }}"
+          sequence:
+            # Hand off to the provisioning recipe runner (Phase 3). HA has no automation
+            # action to rename a device or set its area; that needs the WebSocket API.
+            - event: ha_device_automation_provision
+              event_data:
+                device_id: "{{ device_id }}"
+                profile: tplink_kp115
+                entities: "{{ entities }}"
+        - alias: "Known: Signify Hue bulb"
+          conditions:
+            - condition: template
+              value_template: "{{ manufacturer.startswith('Signify') and 'Hue' in model }}"
+          sequence:
+            - event: ha_device_automation_provision
+              event_data:
+                device_id: "{{ device_id }}"
+                profile: signify_hue_bulb
+                entities: "{{ entities }}"
+      default:
+        - action: persistent_notification.create
+          data:
+            title: "Unknown device added"
+            notification_id: "new_device_{{ device_id }}"
+            message: >
+              {{ name }} ({{ manufacturer }} / {{ model }})
+              id={{ device_id }} identifiers={{ device_attr(device_id, 'identifiers') }}
+              entities={{ entities }}

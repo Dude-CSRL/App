@@ -1,0 +1,55 @@
+blueprint:
+  name: New device by manufacturer/model
+  description: >
+    Run actions when a device with a given manufacturer and model is added to the
+    device registry. Create one automation from this blueprint per device profile.
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    manufacturer:
+      name: Manufacturer
+      description: Exact manufacturer string from the device registry.
+      selector:
+        text:
+    model:
+      name: Model
+      description: Exact model string from the device registry.
+      selector:
+        text:
+    settle_delay:
+      name: Settle delay
+      description: Wait for the integration to register entities before evaluating.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 120
+          unit_of_measurement: seconds
+    recipe:
+      name: Actions
+      description: >
+        What to do for a matched device. The variables device_id and entities are available.
+      selector:
+        action:
+mode: queued
+max: 20
+variables:
+  want_manufacturer: !input manufacturer
+  want_model: !input model
+triggers:
+  - trigger: event
+    event_type: device_registry_updated
+    event_data:
+      action: create
+actions:
+  - delay:
+      seconds: !input settle_delay
+  - variables:
+      device_id: "{{ trigger.event.data.device_id }}"
+      entities: "{{ device_entities(trigger.event.data.device_id) }}"
+  - condition: template
+    value_template: >
+      {{ device_attr(device_id, 'manufacturer') == want_manufacturer
+         and device_attr(device_id, 'model') == want_model }}
+  - sequence: !input recipe
