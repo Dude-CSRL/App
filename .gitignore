@@ -9,3 +9,6 @@ logs/
 *.jsonl
 *.jsonl.*
 state/
+reports/
+!tests/fixtures/**/*.jsonl
+!tests/fixtures/**/*.jsonl.*

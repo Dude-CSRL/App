@@ -51,3 +51,18 @@ Fixtures are device-registry entries (JSON); drop a new `*.json` into `tests/fix
 ### systemd
 See `deploy/systemd/ha-watcher.service` (`Restart=on-failure`, `RestartSec=12`,
 `EnvironmentFile=/etc/ha-watcher/ha-watcher.env`) and `deploy/ha-watcher.env.example`.
+
+### Monitoring report (capture summary)
+
+After a capture window, summarize the log (live file + rotated backups `.1`, `.2`, ...):
+```bash
+python -m ha_watcher.report --log-file logs/device_capture.jsonl --out-dir reports \
+  --profiles-dir profiles --emit-stubs reports/profile_stubs
+```
+- Writes `reports/device_report.md` and `reports/device_report.json`: one row per device ID with
+  manufacturer, model, name, integration domain (first `identifiers` entry), identifiers,
+  connections, suggested area, first/last seen, times seen, and matching profile.
+- Profile matching is a placeholder until Phase 2: a `profiles/*.yaml` file matches on
+  case-insensitive `manufacturer` + `model`; files with `status: draft` are ignored. No profiles dir means all devices are unmatched.
+- `--emit-stubs DIR` writes one `status: draft` YAML stub per unmatched manufacturer+model (existing files are never overwritten).
+- Malformed/truncated lines are skipped and listed in the report. Exit 1 if no log exists.
