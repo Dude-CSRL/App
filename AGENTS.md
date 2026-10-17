@@ -39,6 +39,18 @@ Read `HA_Device_Automation_Roadmap.md` first; it is the source of truth.
   `config/entity_registry/update` response). Treat the first `--apply` on real HA as a test; check dry-run output first.
 - Mock server supports all commands used (`tests/mock_ha_server.py`); `--existing-only` registers fixtures without create events.
 
+## Conventions (Phase 4)
+- Unmatched newly created devices -> `persistent_notification.create` with id `ha_watcher_unmatched_<device_id>`
+  (`ha_watcher/notify.py`). Notifications are the one `call_service` that does NOT go through `provision.Session`
+  (non-destructive; sent regardless of `--provision` mode). `notify.safe_call` never raises; failures only log.
+- `Config.notify_unmatched` defaults to `off`; the CLI flag defaults to `persistent`. Dismissal: `provision --apply`
+  (not dry-run), forced re-log that matches, `notify_unmatched --dismiss-matched`.
+- `ha_watcher.notify_unmatched` is dry-run by default (`--send` to act). `ha_watcher.draft_profile` never overwrites
+  (`open(..., "x")`), writes `status: draft`, and shares `report.build_stub`/`stub_name` with `report --emit-stubs`.
+  Drafts must pass `provision --check-profiles` with no warnings; keep hints commented and quoted (JSON-style).
+- Not verified against live HA: `persistent_notification.create/dismiss` via the WebSocket `call_service` command
+  (dismiss of a missing id), and Markdown rendering of the message.
+
 ## Open items
 - Area-detection automation (Phase 1 gap 8) not yet written.
 - See roadmap "Open Questions".

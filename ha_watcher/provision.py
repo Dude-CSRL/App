@@ -28,7 +28,7 @@ import sys
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from . import matcher
+from . import matcher, notify
 from . import placeholders as ph
 from .client import AuthFailed, HAClient
 from .jsonl import emit, make_capture_logger
@@ -479,6 +479,9 @@ def _brief(call: dict) -> str:
 def format_result(result: dict) -> str:
     out = [f"device {result['device_id']}  mode={result['mode'].upper()}  "
            f"profile={result.get('profile')} ({result.get('matched_by')})  -> {summary_line(result)}"]
+    if result["status"] == "no_match":
+        out.append(f"  hint: no active profile matches. Generate a draft: "
+                   f"python -m ha_watcher.draft_profile --device-id {result['device_id']} --live")
     if result["status"] != "done":
         return "\n".join(out)
     for st in result["steps"]:
@@ -512,6 +515,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--force-welcome", action="store_true", help="fire the welcome automation even if nothing changed")
     p.add_argument("--backup-dir", default=os.environ.get("HA_WATCHER_BACKUP_DIR", "logs/backups"))
     p.add_argument("--provision-log", default=os.environ.get("HA_WATCHER_PROVISION_LOG", "logs/device_provision.jsonl"))
+    p.add_argument("--no-dismiss", action="store_true",
+                   help="with --apply, do not dismiss the device's 'needs a profile' notification")
     p.add_argument("--no-log", action="store_true", help="do not append the result to the provision log")
     p.add_argument("--json", action="store_true", help="print the full result as JSON instead of text")
     p.add_argument("--check-profiles", action="store_true",
@@ -539,6 +544,9 @@ async def _amain(args, token: str, profiles: list[Profile]) -> int:
     opts = Options(apply=args.apply, backup_dir=args.backup_dir, force_welcome=args.force_welcome)
     async with HAClient(args.url, token, args.timeout) as ha:
         result = await provision_device(ha.call, args.device_id, profiles, opts, profile_name=args.profile)
+        if opts.apply and result["status"] == "done" and not args.no_dismiss:
+            # the device now has an active profile applied: clear its 'needs a profile' notification
+            await notify.dismiss(ha.call, args.device_id)
     print(json.dumps(result, indent=2) if args.json else format_result(result))
     if not args.no_log:
         try:

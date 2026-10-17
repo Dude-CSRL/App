@@ -62,6 +62,9 @@ class MockHA:
         self.commands: list[dict] = []
         self.mutations: list[dict] = []
         self.fail_types: set[str] = set()  # command types that answer success=false
+        self.fail_services: set[str] = set()  # "domain.service" calls (call_service) that answer success=false
+        self.notifications: dict[str, dict] = {}  # persistent notifications by id (create updates in place)
+        self.notification_log: list[tuple[str, str]] = []  # ("create"|"dismiss", notification_id)
         self.subscribers: dict = {}  # ws -> subscription id
         self.subscribed = asyncio.Event()
         self.auth_attempts = 0
@@ -157,6 +160,17 @@ class MockHA:
             dash["config"] = msg["config"]
             return self._ok(mid)
         if t == "call_service":
+            svc = f"{msg.get('domain')}.{msg.get('service')}"
+            if svc in self.fail_services:
+                return self._err(mid, "mock_failure", f"{svc} forced to fail")
+            data = msg.get("service_data") or {}
+            if svc == "persistent_notification.create":
+                nid = data.get("notification_id") or f"notification_{len(self.notifications) + 1}"
+                self.notifications[nid] = dict(data)
+                self.notification_log.append(("create", nid))
+            elif svc == "persistent_notification.dismiss":
+                self.notifications.pop(data.get("notification_id"), None)
+                self.notification_log.append(("dismiss", data.get("notification_id")))
             return self._ok(mid, {"context": {"id": "01MOCKCTX"}})
         if t == "ping":
             return {"id": mid, "type": "pong"}

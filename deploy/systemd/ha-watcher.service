@@ -15,6 +15,8 @@ ExecStart=/opt/ha-watcher/.venv/bin/python -m ha_watcher --log-file /var/log/ha-
 # Phase 3 (optional): add `--provision dry-run` (log plans only) or `--provision apply` (MODIFIES HA) plus
 # `--profiles-dir`, `--provision-log /var/log/ha-watcher/device_provision.jsonl` and
 # `--backup-dir /var/lib/ha-watcher/backups` to ExecStart above. Default is off. Start with dry-run.
+# Phase 4: unmatched new devices raise a persistent HA notification by default (`--notify-unmatched persistent`);
+# add `--notify-unmatched off` to ExecStart to disable. Notification failures are logged and never stop the service.
 # Survive power flashes / HA restarts. Note: auth_invalid exits 2 and will also be
 # restarted every 12s; the repeated failures in `journalctl -u ha-watcher` are the signal.
 Restart=on-failure
