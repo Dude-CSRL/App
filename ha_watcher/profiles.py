@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml
 
+from . import placeholders as ph
+
 STATUSES = ("draft", "active")
 TOP_KEYS = {"name", "description", "status", "match", "recipe", "source"}
 MATCH_KEYS = {"manufacturer", "model", "entity_patterns"}
@@ -53,6 +55,7 @@ class LoadResult:
     directory: str | None
     profiles: list[Profile] = field(default_factory=list)
     errors: list[ProfileError] = field(default_factory=list)
+    warnings: list[ProfileError] = field(default_factory=list)  # loaded, but a recipe step will not run as written
     directory_found: bool = False
 
     @property
@@ -160,6 +163,35 @@ def validate_profile(data: Any, file: str) -> tuple[Profile | None, list[str]]:
                    entity_patterns=patterns, recipe=recipe, description=desc), []
 
 
+def _wildcards(pattern: str) -> int:
+    return pattern.count("*") + pattern.count("?")
+
+
+def recipe_warnings(recipe: dict) -> list[str]:
+    """Placeholder problems in a recipe. Warnings, not errors: the profile still loads and
+    matches; the affected recipe step is skipped at provision time with the same message."""
+    out: list[str] = []
+    name = recipe.get("name")
+    if isinstance(name, str):
+        out += [f"recipe.name: {m}" for m in ph.validate(name, ph.NAME_ALLOWED)]
+    for i, rule in enumerate(recipe.get("entity_id_cleanup") or []):
+        if not isinstance(rule, dict):
+            continue
+        to, frm = rule.get("to"), rule.get("from")
+        if isinstance(to, str) and isinstance(frm, str):
+            out += [f"recipe.entity_id_cleanup[{i}].to: {m}"
+                    for m in ph.validate(to, ph.ID_ALLOWED, max_capture=_wildcards(frm))]
+            if "*" in to or "?" in to:
+                out.append(f"recipe.entity_id_cleanup[{i}].to: wildcards are not supported in 'to'; "
+                           "use {1}, {2}, ... for what the wildcards in 'from' matched")
+    card = recipe.get("dashboard_card")
+    if isinstance(card, dict):
+        for text in ph.walk_strings(card.get("card")):
+            out += [f"recipe.dashboard_card.card: {m}"
+                    for m in ph.validate(text, ph.CARD_ALLOWED, allow_entity=True)]
+    return out
+
+
 def load_profiles(profiles_dir: str | os.PathLike | None) -> LoadResult:
     """Load every *.yaml / *.yml in profiles_dir. Never raises for bad files."""
     res = LoadResult(directory=str(profiles_dir) if profiles_dir else None)
@@ -192,4 +224,6 @@ def load_profiles(profiles_dir: str | os.PathLike | None) -> LoadResult:
             continue
         names[profile.name] = path.name
         res.profiles.append(profile)
+        for w in recipe_warnings(profile.recipe):
+            res.warnings.append(ProfileError(path.name, w))
     return res

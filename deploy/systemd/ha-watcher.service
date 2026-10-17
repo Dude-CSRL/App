@@ -12,6 +12,9 @@ WorkingDirectory=/opt/ha-watcher
 # Holds HA_URL, HA_TOKEN, HA_TOKEN_CREATED. chmod 600, owned by the service user.
 EnvironmentFile=/etc/ha-watcher/ha-watcher.env
 ExecStart=/opt/ha-watcher/.venv/bin/python -m ha_watcher --log-file /var/log/ha-watcher/device_capture.jsonl --state-file /var/lib/ha-watcher/seen_devices.json
+# Phase 3 (optional): add `--provision dry-run` (log plans only) or `--provision apply` (MODIFIES HA) plus
+# `--profiles-dir`, `--provision-log /var/log/ha-watcher/device_provision.jsonl` and
+# `--backup-dir /var/lib/ha-watcher/backups` to ExecStart above. Default is off. Start with dry-run.
 # Survive power flashes / HA restarts. Note: auth_invalid exits 2 and will also be
 # restarted every 12s; the repeated failures in `journalctl -u ha-watcher` are the signal.
 Restart=on-failure

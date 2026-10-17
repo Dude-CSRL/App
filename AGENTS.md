@@ -20,8 +20,24 @@ Read `HA_Device_Automation_Roadmap.md` first; it is the source of truth.
   `ha_watcher/matcher.py`. Only `status: active` profiles match; case-insensitive exact manufacturer+model, then
   glob `entity_patterns` (all must match). Invalid profile files are logged and skipped, never fatal.
 - Capture lines carry additive `entities` and `match` fields; never alter `raw_payload`/`device`.
-- `recipe` is parsed/validated only. Executing it is Phase 3. Keep `profiles/example_hue_bulb.yaml` as `draft`.
+- `recipe` is executed by `ha_watcher/provision.py` (Phase 3). Keep `profiles/example_hue_bulb.yaml` as `draft`.
 - Profiles must come from real captured payloads; tests use `tests/fixtures/profiles/`.
+
+## Conventions (Phase 3)
+- **Dry-run is the default everywhere.** Mutating commands are listed in `provision.MUTATING_TYPES` and only sent
+  when `Options.apply` is true (`--apply` / `--provision apply`); the check lives in `Session.call` only. Any new
+  mutating API call MUST be added to that set.
+- Steps return ok / skipped / failed with a `reason`; never raise into the watcher. Steps compare current vs desired
+  state first (idempotent). Placeholders are specified in `docs/profile-schema.md`; unknown ones warn at load and skip
+  the step at run time, they never invalidate a profile (do not tighten profile validation: deployed profiles must keep loading).
+- Provision results go to a separate rotating JSONL (`--provision-log`); capture lines are not modified.
+- `ha_watcher.snapshot` writes `event_type: snapshot` lines to its own file (atomic replace); it must never touch the
+  capture log or the dedup state. `ha_watcher.report --snapshot-file` reads it.
+- `entity_patterns` match current entity ids, so patterns that only fit pre-cleanup names stop matching after a rename;
+  prefer patterns that survive the cleanup, or replay with `--profile`.
+- Not verified against a live HA: entity-registry/lovelace command shapes (`lovelace/info`, `lovelace/config/save`,
+  `config/entity_registry/update` response). Treat the first `--apply` on real HA as a test; check dry-run output first.
+- Mock server supports all commands used (`tests/mock_ha_server.py`); `--existing-only` registers fixtures without create events.
 
 ## Open items
 - Area-detection automation (Phase 1 gap 8) not yet written.
