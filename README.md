@@ -28,6 +28,7 @@ pytest
 | `--backoff-initial` / `--backoff-max` | 1 / 60 s | reconnect backoff (full jitter) |
 | `--profiles-dir` / `HA_WATCHER_PROFILES` | `profiles` | profile YAMLs used for matching (Phase 2) |
 | `--match-settle-delay` | 10 s | wait for entities to register before matching `entity_patterns` |
+| `--notify-unmatched {off,persistent}` / `HA_WATCHER_NOTIFY_UNMATCHED` | `persistent` | raise an HA persistent notification for each newly created device with no matching profile (Phase 4) |
 | `--provision {off,dry-run,apply}` / `HA_WATCHER_PROVISION` | `off` | run the matched profile's recipe for newly created devices (Phase 3) |
 | `--provision-log` | `logs/device_provision.jsonl` | rotating JSONL of provision plans/results |
 | `--backup-dir` | `logs/backups` | dashboard config backups taken before any dashboard save |
@@ -155,3 +156,49 @@ export HA_URL=ws://127.0.0.1:8765/api/websocket HA_TOKEN=test-token             
 python -m ha_watcher.snapshot --out logs/mock_snapshot.jsonl --profiles-dir tests/fixtures/provision_profiles
 python -m ha_watcher.provision --device-id a1b2c3d4e5f60718293a4b5c6d7e8f90 --profiles-dir tests/fixtures/provision_profiles
 ```
+
+## Phase 4: unmatched-device fallback and re-run
+
+**Notification.** With `--notify-unmatched persistent` (the watcher default), every newly captured device whose match
+result is unmatched (including `no_device_details`) calls `persistent_notification.create` with the stable id
+`ha_watcher_unmatched_<device_id>` (a repeat updates the same notification). The message lists device id, name,
+manufacturer, model, identifiers, connections, entities, and the exact commands to generate a draft and replay it.
+It is sent regardless of `--provision` mode (not destructive). If the call fails it is logged as a warning; the watcher
+keeps running. Pass `--notify-unmatched off` to disable. The notification is dismissed when the device is later
+provisioned with `provision --apply`, when a `--force-device-id` re-log now matches, or via `notify_unmatched --dismiss-matched`.
+
+**Notify for devices already in HA (opt-in, dry-run by default):**
+```bash
+python -m ha_watcher.notify_unmatched --snapshot-file logs/device_snapshot.jsonl --profiles-dir profiles          # prints only
+python -m ha_watcher.notify_unmatched --snapshot-file logs/device_snapshot.jsonl --device-id <id> --send           # one device
+python -m ha_watcher.notify_unmatched --snapshot-file logs/device_snapshot.jsonl --send --dismiss-matched         # all
+```
+
+**Draft profile from a captured device** (`status: draft`, current schema, never overwrites, prints the path):
+```bash
+python -m ha_watcher.draft_profile --device-id <id> --live --profiles-dir profiles          # or --from-snapshot FILE / --from-log FILE
+python -m ha_watcher.provision --check-profiles --profiles-dir profiles
+```
+`match` manufacturer/model come from the real payload. `entity_patterns`, `entity_id_cleanup` and `dashboard_card` are
+commented hints in the final placeholder syntax: review every mapping, uncomment (delete the `[]` / `null` line above),
+fill `name` and `area`, set `status: active`.
+
+**Fix a profile, then replay on a device already in the registry:**
+```bash
+python -m ha_watcher.provision --device-id <id> --profiles-dir profiles            # no_match (exit 4) -> hint to draft
+python -m ha_watcher.draft_profile --device-id <id> --live --profiles-dir profiles  # edit the draft, set status: active
+python -m ha_watcher.provision --device-id <id> --profiles-dir profiles            # DRY-RUN plan
+python -m ha_watcher.provision --device-id <id> --profiles-dir profiles --apply    # execute, dismisses the notification
+```
+Replays are idempotent. Covered end to end by `tests/test_draft_and_replay.py::test_fix_profile_then_replay_flow`.
+
+### Testing on the mini PC
+Adjust paths (`/home/dude/ha-watcher-app`) and load the service env as in the Phase 3 section.
+1. **No create event needed:** pick any currently unmatched device from the report/snapshot and run
+   `python -m ha_watcher.notify_unmatched --snapshot-file logs/device_snapshot.jsonl --device-id <id> --send`.
+   Look for the notification in HA (bell icon); re-run to see it update, not stack.
+2. **Real watcher path:** the watcher only notifies on a genuine create event (`--force-device-id` re-logs a device
+   only when HA fires a create for it again). To exercise it end to end, move one profile aside
+   (`mv profiles/x.yaml /tmp/`), restart the service, then add a new device (or remove and re-add a spare one).
+   Put the profile back and restart afterwards. Option 1 is the safe, repeatable test.
+3. Generate a draft for it: `python -m ha_watcher.draft_profile --device-id <id> --live --profiles-dir /tmp/drafts`.

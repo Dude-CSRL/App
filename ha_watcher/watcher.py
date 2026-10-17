@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import websockets
 
-from . import matcher, provision
+from . import matcher, notify, provision
 from .client import AuthFailed, authenticate
 from .jsonl import emit, make_capture_logger
 from .profiles import LoadResult, load_profiles
@@ -48,6 +48,7 @@ class Config:
     profiles_dir: str | None = None  # None disables matching (CLI default: profiles)
     match_settle_delay: float = 10.0  # wait before reading entities when a profile needs entity patterns
     request_timeout: float = 30.0
+    notify_unmatched: str = "off"  # off | persistent (CLI default: persistent)
     provision_mode: str = "off"  # off | dry-run | apply (Phase 3)
     provision_log_file: str = "logs/device_provision.jsonl"
     backup_dir: str = "logs/backups"  # lovelace config backups taken before any dashboard save
@@ -108,6 +109,8 @@ class Watcher:
             diag.error("INVALID PROFILE (skipped) %s", err)
         if res.errors:
             diag.error("%d profile file(s) skipped; fix them and restart the watcher", len(res.errors))
+        if self.cfg.notify_unmatched != "off":
+            diag.info("unmatched devices raise a persistent notification in HA (%s*)", notify.ID_PREFIX)
         mode = self.cfg.provision_mode
         if mode == "apply":
             diag.warning("PROVISIONING IS ENABLED (apply): matched devices will be MODIFIED in Home Assistant")
@@ -207,8 +210,21 @@ class Watcher:
                     entity_ids = [e["entity_id"] for e in res.get("result") or []
                                   if e.get("device_id") == device_id and e.get("entity_id")]
         record = self._log_created(event_msg, device, entity_ids)
-        if record and record["match"]["matched"] and self.cfg.provision_mode != "off":
+        if record is None:
+            return
+        if self.cfg.notify_unmatched != "off":
+            if not record["match"]["matched"]:
+                await notify.notify_unmatched(self._caller(ws, pending), record["device_id"], device, entity_ids,
+                                              record["match"].get("reason"), self.cfg.profiles_dir)
+            elif record["forced"]:  # a forced re-log that now matches: clear the old notification
+                await notify.dismiss(self._caller(ws, pending), record["device_id"])
+        if record["match"]["matched"] and self.cfg.provision_mode != "off":
             await self._provision(ws, pending, record, waited)
+
+    def _caller(self, ws, pending: dict):
+        async def caller(payload: dict) -> dict:
+            return await self._call(ws, payload, pending)
+        return caller
 
     async def _provision(self, ws, pending: dict, record: dict, waited: bool) -> None:
         """Run the matched profile's recipe (dry-run or apply). Never raises (except cancellation)."""
@@ -217,9 +233,7 @@ class Watcher:
             if not waited:  # entities register shortly after the device; let them settle
                 await asyncio.sleep(self.cfg.match_settle_delay)
 
-            async def caller(payload: dict) -> dict:
-                return await self._call(ws, payload, pending)
-
+            caller = self._caller(ws, pending)
             opts = provision.Options(apply=self.cfg.provision_mode == "apply", backup_dir=self.cfg.backup_dir)
             # re-match on fresh registry data (entities have had time to register)
             result = await provision.provision_device(caller, device_id, self.profiles.profiles, opts)
@@ -320,6 +334,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="directory of profile YAML files used to match devices (default: profiles)")
     p.add_argument("--match-settle-delay", type=float, default=10.0,
                    help="seconds to wait for entities to register before matching entity_patterns")
+    p.add_argument("--notify-unmatched", choices=list(notify.MODES),
+                   default=os.environ.get("HA_WATCHER_NOTIFY_UNMATCHED", "persistent"),
+                   help="raise a persistent HA notification for each newly created device that matches no "
+                        "profile (default: persistent). Sent regardless of --provision mode; failures only log.")
     p.add_argument("--provision", choices=["off", "dry-run", "apply"],
                    default=os.environ.get("HA_WATCHER_PROVISION", "off"),
                    help="run the matched profile's recipe for newly created devices. off (default) | "
@@ -348,7 +366,7 @@ def main(argv=None) -> int:
         backoff_max=args.backoff_max, token_created=os.environ.get("HA_TOKEN_CREATED"),
         fetch_device_details=not args.no_device_details,
         profiles_dir=args.profiles_dir, match_settle_delay=args.match_settle_delay,
-        provision_mode=args.provision, provision_log_file=args.provision_log, backup_dir=args.backup_dir,
+        notify_unmatched=args.notify_unmatched, provision_mode=args.provision, provision_log_file=args.provision_log, backup_dir=args.backup_dir,
     )
     try:
         return asyncio.run(Watcher(cfg).run())
