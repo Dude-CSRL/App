@@ -1,0 +1,21 @@
+name: hue_full
+status: active
+match:
+  manufacturer: Signify Netherlands B.V.
+  model: Hue white and color ambiance A19
+  entity_patterns: ["light.hue_*"]
+recipe:
+  name: "Hue Bulb"
+  area: Living Room
+  entity_id_cleanup:
+    - {from: "light.hue_*", to: "light.{area}_{name}"}
+    - {from: "sensor.hue_color_lamp_1_*", to: "sensor.{area}_{name}_{1}"}
+  dashboard_card:
+    dashboard: lovelace
+    view: lights
+    card:
+      type: light
+      entity: "{entity:light}"
+      name: "{device_name} ({area_name})"
+      note: "{{ states('sensor.x') }}"   # Home Assistant Jinja stays literal
+  welcome_automation: automation.welcome_hue

@@ -5,7 +5,7 @@ device ID, and writes a Markdown + JSON report. Optionally emits draft profile s
 (YAML) to seed Phase 2 profiles. Matching uses ha_watcher.matcher.
 
     python -m ha_watcher.report --log-file logs/device_capture.jsonl --out-dir reports \
-        [--profiles-dir profiles] [--emit-stubs reports/profile_stubs]
+        [--profiles-dir profiles] [--emit-stubs reports/profile_stubs] [--snapshot-file logs/device_snapshot.jsonl]
 """
 from __future__ import annotations
 
@@ -58,9 +58,9 @@ def integration_domain(device: dict) -> str | None:
     return None
 
 
-def summarize(log_file: str, profiles_dir: str | None = None) -> dict:
+def summarize(log_file: str, profiles_dir: str | None = None, snapshot_files=()) -> dict:
     errors: list = []
-    paths = log_files(log_file)
+    paths = log_files(log_file) + [f for f in snapshot_files if os.path.exists(f)]
     devices: dict[str, dict] = {}
     for rec in iter_records(paths, errors):
         did = rec["device_id"]
@@ -71,7 +71,11 @@ def summarize(log_file: str, profiles_dir: str | None = None) -> dict:
             d = devices[did] = {"device_id": did, "first_seen": ts, "last_seen": ts, "occurrences": 0}
             d.update({f: None for f in FIELDS})
             d["entity_ids"] = None
+            d["seen_via"] = []
         d["occurrences"] += 1
+        via = rec.get("event_type") == "snapshot" and "snapshot" or "capture"
+        if via not in d["seen_via"]:
+            d["seen_via"].append(via)
         if ts and (not d["first_seen"] or ts < d["first_seen"]):
             d["first_seen"] = ts
         if ts and (not d["last_seen"] or ts > d["last_seen"]):
@@ -122,14 +126,14 @@ def render_markdown(rep: dict) -> str:
         f"- Profiles loaded: {rep['profiles_loaded']} ({rep['profiles_active']} active; drafts are never matched)",
         f"- Invalid profile files: {len(rep['profile_errors'])}",
         f"- Malformed lines skipped: {len(rep['malformed_lines'])}", "",
-        "| Device ID | Manufacturer | Model | Name | Domain | Identifiers | Connections | Suggested area | First seen | Last seen | Seen | Profile |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Device ID | Manufacturer | Model | Name | Domain | Identifiers | Connections | Suggested area | First seen | Last seen | Seen | Profile | Via |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for d in rep["devices"]:
         out.append("| " + " | ".join(_fmt(x) for x in (
             d["device_id"], d["manufacturer"], d["model"], d["name"], d["integration_domain"],
             d["identifiers"], d["connections"], d["suggested_area"], d["first_seen"], d["last_seen"],
-            d["occurrences"], d["profile_match"] or "unmatched")) + " |")
+            d["occurrences"], d["profile_match"] or "unmatched", d["seen_via"])) + " |")
     if rep["profile_errors"]:
         out += ["", "## Invalid profiles (skipped)", ""]
         out += [f"- {e['file']}: {e['error']}" for e in rep["profile_errors"]]
@@ -179,13 +183,15 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="ha_watcher.report", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--log-file", default=os.environ.get("HA_WATCHER_LOG", "logs/device_capture.jsonl"))
+    p.add_argument("--snapshot-file", action="append", default=[], metavar="FILE",
+                   help="also read a snapshot written by ha_watcher.snapshot (repeatable)")
     p.add_argument("--out-dir", default="reports")
     p.add_argument("--profiles-dir", default="profiles")
     p.add_argument("--emit-stubs", metavar="DIR", help="write draft profile stubs for unmatched devices")
     a = p.parse_args(argv)
-    rep = summarize(a.log_file, a.profiles_dir)
+    rep = summarize(a.log_file, a.profiles_dir, a.snapshot_file)
     if not rep["log_files"]:
-        print(f"ERROR: no capture log found at {a.log_file}", file=sys.stderr)
+        print(f"ERROR: no capture log found at {a.log_file} and no snapshot file given", file=sys.stderr)
         return 1
     os.makedirs(a.out_dir, exist_ok=True)
     jp, mp = os.path.join(a.out_dir, "device_report.json"), os.path.join(a.out_dir, "device_report.md")

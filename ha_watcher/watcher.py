@@ -17,7 +17,9 @@ from dataclasses import dataclass, field
 
 import websockets
 
-from . import matcher
+from . import matcher, provision
+from .client import AuthFailed, authenticate
+from .jsonl import emit, make_capture_logger
 from .profiles import LoadResult, load_profiles
 from .state import SeenDevices
 
@@ -28,10 +30,6 @@ EXIT_CONFIG_ERROR = 3
 TOKEN_MAX_AGE_DAYS = 90
 
 diag = logging.getLogger("ha_watcher")
-
-
-class AuthFailed(Exception):
-    """HA rejected the token (auth_invalid). Never retried."""
 
 
 @dataclass
@@ -50,6 +48,9 @@ class Config:
     profiles_dir: str | None = None  # None disables matching (CLI default: profiles)
     match_settle_delay: float = 10.0  # wait before reading entities when a profile needs entity patterns
     request_timeout: float = 30.0
+    provision_mode: str = "off"  # off | dry-run | apply (Phase 3)
+    provision_log_file: str = "logs/device_provision.jsonl"
+    backup_dir: str = "logs/backups"  # lovelace config backups taken before any dashboard save
 
 
 def backoff_delays(initial: float, cap: float, rng: random.Random | None = None):
@@ -60,23 +61,6 @@ def backoff_delays(initial: float, cap: float, rng: random.Random | None = None)
         ceiling = min(cap, initial * (2 ** attempt))
         yield rng.uniform(0, ceiling)
         attempt += 1
-
-
-def make_capture_logger(path: str, max_bytes: int, backup_count: int) -> logging.Logger:
-    d = os.path.dirname(os.path.abspath(path))
-    os.makedirs(d, exist_ok=True)
-    logger = logging.getLogger(f"ha_watcher.capture.{os.path.abspath(path)}")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-        h.close()
-    handler = logging.handlers.RotatingFileHandler(
-        path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-    )
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(handler)
-    return logger
 
 
 def check_token_age(token_created: str | None, today: dt.date | None = None) -> str | None:
@@ -105,6 +89,8 @@ class Watcher:
         self._msg_id = 0
         self.connections = 0  # successful authenticated sessions (useful for tests)
         self.profiles: LoadResult = load_profiles(cfg.profiles_dir)
+        self.provision_log = (make_capture_logger(cfg.provision_log_file, cfg.max_bytes, cfg.backup_count)
+                              if cfg.provision_mode != "off" else None)
         self._report_profiles()
 
     def _report_profiles(self) -> None:
@@ -116,26 +102,25 @@ class Watcher:
         else:
             diag.info("loaded %d profile(s) from %s: %d active, %d draft (drafts are not matched)",
                       len(res.profiles), self.cfg.profiles_dir, len(res.active), len(res.drafts))
+        for warn in res.warnings:
+            diag.warning("PROFILE WARNING %s", warn)
         for err in res.errors:
             diag.error("INVALID PROFILE (skipped) %s", err)
         if res.errors:
             diag.error("%d profile file(s) skipped; fix them and restart the watcher", len(res.errors))
+        mode = self.cfg.provision_mode
+        if mode == "apply":
+            diag.warning("PROVISIONING IS ENABLED (apply): matched devices will be MODIFIED in Home Assistant")
+        elif mode == "dry-run":
+            diag.info("provisioning in dry-run mode: plans are logged to %s, nothing is changed",
+                      self.cfg.provision_log_file)
 
     def _next_id(self) -> int:
         self._msg_id += 1
         return self._msg_id
 
     async def _authenticate(self, ws) -> None:
-        first = json.loads(await ws.recv())
-        if first.get("type") != "auth_required":
-            raise ConnectionError(f"unexpected first message: {first!r}")
-        await ws.send(json.dumps({"type": "auth", "access_token": self.cfg.token}))
-        reply = json.loads(await ws.recv())
-        if reply.get("type") == "auth_invalid":
-            raise AuthFailed(reply.get("message", "auth_invalid"))
-        if reply.get("type") != "auth_ok":
-            raise ConnectionError(f"unexpected auth reply: {reply!r}")
-        diag.info("authenticated to HA %s", reply.get("ha_version", "?"))
+        await authenticate(ws, self.cfg.token)
 
     async def _call(self, ws, payload: dict, pending: dict) -> dict:
         """Send a command and wait for its result message (resolved by the receive loop)."""
@@ -163,16 +148,21 @@ class Watcher:
     def handle_created(self, event_msg: dict, device: dict | None,
                        entity_ids: list[str] | None = None) -> bool:
         """Log a device-created event. Returns True if a line was written."""
+        return self._log_created(event_msg, device, entity_ids) is not None
+
+    def _log_created(self, event_msg: dict, device: dict | None,
+                     entity_ids: list[str] | None = None) -> dict | None:
+        """Log a device-created event. Returns the record written, or None if skipped."""
         event = event_msg.get("event", {})
         data = event.get("data", {})
         device_id = data.get("device_id")
         if not device_id:
             diag.warning("create event without device_id: %r", event_msg)
-            return False
+            return None
         forced = device_id in self.cfg.force_device_ids
         if device_id in self.seen and not forced:
             diag.info("dedup: device %s already logged, skipping", device_id)
-            return False
+            return None
         match = self.match_result(device, entity_ids)
         record = {
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -185,13 +175,11 @@ class Watcher:
             "entities": entity_ids,
             "match": match,
         }
-        self.capture.info(json.dumps(record, sort_keys=False, separators=(",", ":")))
-        for h in self.capture.handlers:
-            h.flush()
+        emit(self.capture, record)
         self.seen.add(device_id)
         diag.info("captured device %s%s -> %s", device_id, " (forced)" if forced else "",
                   f"matched profile {match['profile']}" if match["matched"] else "unmatched")
-        return True
+        return record
 
     async def _fetch_device(self, ws, pending, device_id: str) -> dict | None:
         res = await self._call(ws, {"type": "config/device_registry/list"}, pending)
@@ -206,17 +194,43 @@ class Watcher:
             self.handle_created(event_msg, None)  # logs the dedup/skip decision
             return
         device = entity_ids = None
+        waited = False
         if self.cfg.fetch_device_details:
             device = await self._fetch_device(ws, pending, device_id)
             if device is not None and matcher.needs_entities(device, self.profiles.profiles):
                 # Entities are registered shortly after the device; wait, then re-read both.
                 await asyncio.sleep(self.cfg.match_settle_delay)
+                waited = True
                 device = await self._fetch_device(ws, pending, device_id) or device
                 res = await self._call(ws, {"type": "config/entity_registry/list"}, pending)
                 if res.get("success"):
                     entity_ids = [e["entity_id"] for e in res.get("result") or []
                                   if e.get("device_id") == device_id and e.get("entity_id")]
-        self.handle_created(event_msg, device, entity_ids)
+        record = self._log_created(event_msg, device, entity_ids)
+        if record and record["match"]["matched"] and self.cfg.provision_mode != "off":
+            await self._provision(ws, pending, record, waited)
+
+    async def _provision(self, ws, pending: dict, record: dict, waited: bool) -> None:
+        """Run the matched profile's recipe (dry-run or apply). Never raises (except cancellation)."""
+        device_id, profile = record["device_id"], record["match"]["profile"]
+        try:
+            if not waited:  # entities register shortly after the device; let them settle
+                await asyncio.sleep(self.cfg.match_settle_delay)
+
+            async def caller(payload: dict) -> dict:
+                return await self._call(ws, payload, pending)
+
+            opts = provision.Options(apply=self.cfg.provision_mode == "apply", backup_dir=self.cfg.backup_dir)
+            # re-match on fresh registry data (entities have had time to register)
+            result = await provision.provision_device(caller, device_id, self.profiles.profiles, opts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # provisioning must never take the watcher down
+            diag.error("provisioning %s crashed: %r", device_id, exc)
+            result = provision.error_result(device_id, profile, self.cfg.provision_mode, repr(exc))
+        emit(self.provision_log, result)
+        diag.info("provision[%s] %s profile=%s: %s", result["mode"], device_id, profile,
+                  provision.summary_line(result))
 
     async def run_once(self) -> None:
         """One connection lifetime. Raises AuthFailed, or returns/raises on disconnect."""
@@ -306,6 +320,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="directory of profile YAML files used to match devices (default: profiles)")
     p.add_argument("--match-settle-delay", type=float, default=10.0,
                    help="seconds to wait for entities to register before matching entity_patterns")
+    p.add_argument("--provision", choices=["off", "dry-run", "apply"],
+                   default=os.environ.get("HA_WATCHER_PROVISION", "off"),
+                   help="run the matched profile's recipe for newly created devices. off (default) | "
+                        "dry-run (log the plan, change nothing) | apply (MODIFIES Home Assistant)")
+    p.add_argument("--provision-log", default=os.environ.get("HA_WATCHER_PROVISION_LOG", "logs/device_provision.jsonl"))
+    p.add_argument("--backup-dir", default=os.environ.get("HA_WATCHER_BACKUP_DIR", "logs/backups"),
+                   help="where dashboard config backups go before any dashboard save")
     p.add_argument("--no-device-details", action="store_true",
                    help="don't fetch config/device_registry/list for created devices")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -327,6 +348,7 @@ def main(argv=None) -> int:
         backoff_max=args.backoff_max, token_created=os.environ.get("HA_TOKEN_CREATED"),
         fetch_device_details=not args.no_device_details,
         profiles_dir=args.profiles_dir, match_settle_delay=args.match_settle_delay,
+        provision_mode=args.provision, provision_log_file=args.provision_log, backup_dir=args.backup_dir,
     )
     try:
         return asyncio.run(Watcher(cfg).run())

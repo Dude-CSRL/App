@@ -12,7 +12,7 @@ match:
   entity_patterns:          # optional; every pattern must match one of the device's entity IDs
     - "light.*"
 
-# Parsed and validated in Phase 2, executed in Phase 3.
+# Executed by ha_watcher.provision (dry-run unless --apply). Placeholders: docs/profile-schema.md
 recipe:
   name: "Hue Bulb"
   area: null                # null = ask / infer later (roadmap: area inference)
@@ -24,5 +24,5 @@ recipe:
     view: lights
     card:
       type: light
-      entity: "{light_entity}"
+      entity: "{entity:light}"
   welcome_automation: null
